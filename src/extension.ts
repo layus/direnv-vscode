@@ -177,9 +177,97 @@ class Direnv implements vscode.Disposable {
 		const basename = path.basename(file)
 		const pattern = new vscode.RelativePattern(vscode.Uri.file(dirname), basename)
 		const watcher = vscode.workspace.createFileSystemWatcher(pattern)
-		watcher.onDidChange(() => this.reload())
-		watcher.onDidCreate(() => this.reload())
-		watcher.onDidDelete(() => this.reload())
+
+		let size: number | undefined
+		let mtime: number | undefined
+		let hash: string | undefined
+
+		const reload = async (reason: string) => {
+			this.output.appendLine(`trigger: ${reason} ${file}`)
+			await this.reload()
+		}
+
+		const digest = async (uri: vscode.Uri) => {
+			const data = await vscode.workspace.fs.readFile(uri)
+			return Checksum.createHash(data)
+		}
+
+		const onChange = async () => {
+			const uri = vscode.Uri.file(file)
+
+			try {
+				const stat = await vscode.workspace.fs.stat(uri)
+
+				if (stat.type !== vscode.FileType.File) {
+					await reload('change non-file')
+					return
+				}
+
+				if (mtime === stat.mtime && size === stat.size) {
+					this.output.appendLine(`ignored: unchanged stat ${file}`)
+					return
+				}
+
+				const nextMtime = stat.mtime
+				const nextSize = stat.size
+
+				let nextHash: string
+				try {
+					nextHash = await digest(uri)
+				} catch (err) {
+					this.output.appendLine(
+						`stat changed but hashing failed ${file}: ${String(err)}`,
+					)
+					await reload('change uncertain')
+					return
+				}
+
+				if (
+					mtime !== undefined &&
+					size !== undefined &&
+					hash !== undefined &&
+					hash === nextHash
+				) {
+					mtime = nextMtime
+					size = nextSize
+					hash = nextHash
+					this.output.appendLine(`ignored: unchanged content ${file}`)
+					return
+				}
+
+				mtime = nextMtime
+				size = nextSize
+				hash = nextHash
+				await reload('change')
+			} catch (err) {
+				this.output.appendLine(`change check failed ${file}: ${String(err)}`)
+				await reload('change uncertain')
+			}
+		}
+
+		const onCreate = async () => {
+			mtime = undefined
+			size = undefined
+			hash = undefined
+			await reload('create')
+		}
+
+		const onDelete = async () => {
+			mtime = undefined
+			size = undefined
+			hash = undefined
+			await reload('delete')
+		}
+
+		watcher.onDidChange(() => {
+			void onChange()
+		})
+		watcher.onDidCreate(() => {
+			void onCreate()
+		})
+		watcher.onDidDelete(() => {
+			void onDelete()
+		})
 		this.output.appendLine(`watching: ${file}`)
 		return watcher
 	}
