@@ -28,6 +28,8 @@ class Direnv implements vscode.Disposable {
 	private didUpdate = new vscode.EventEmitter<void>()
 	private blockedPath?: string
 	private cwdOverride?: string
+	private reloadTimer?: NodeJS.Timeout
+	private reloadBurstStartedAt?: number
 	private watchers = vscode.Disposable.from()
 
 	constructor(
@@ -54,6 +56,10 @@ class Direnv implements vscode.Disposable {
 	dispose() {
 		this.output.dispose()
 		this.status.dispose()
+		if (this.reloadTimer) {
+			clearTimeout(this.reloadTimer)
+			this.reloadTimer = undefined
+		}
 		this.watchers.dispose()
 	}
 
@@ -172,14 +178,123 @@ class Direnv implements vscode.Disposable {
 		await this.cache.update(Cached.cwdOverride, undefined)
 	}
 
+	private scheduleReload(reason: string) {
+		const now = Date.now()
+		this.reloadBurstStartedAt ??= now
+
+		const elapsed = now - this.reloadBurstStartedAt
+		const delay = elapsed >= 1000 ? 0 : Math.min(100, 1000 - elapsed)
+
+		if (this.reloadTimer) {
+			clearTimeout(this.reloadTimer)
+		}
+
+		this.output.appendLine(`queue reload: ${reason} in ${delay}ms`)
+
+		this.reloadTimer = setTimeout(() => {
+			this.reloadTimer = undefined
+			this.reloadBurstStartedAt = undefined
+			this.output.appendLine(`run reload: ${reason}`)
+			void this.reload()
+		}, delay)
+	}
+
 	private createWatcher(file: string) {
 		const dirname = path.dirname(file)
 		const basename = path.basename(file)
 		const pattern = new vscode.RelativePattern(vscode.Uri.file(dirname), basename)
 		const watcher = vscode.workspace.createFileSystemWatcher(pattern)
-		watcher.onDidChange(() => this.reload())
-		watcher.onDidCreate(() => this.reload())
-		watcher.onDidDelete(() => this.reload())
+
+		let size: number | undefined
+		let mtime: number | undefined
+		let hash: string | undefined
+
+		const reload = (reason: string) => {
+			this.output.appendLine(`trigger: ${reason} ${file}`)
+			this.scheduleReload(`${reason} ${file}`)
+		}
+
+		const digest = async (uri: vscode.Uri) => {
+			const data = await vscode.workspace.fs.readFile(uri)
+			return Checksum.createHash(data)
+		}
+
+		const onChange = async () => {
+			const uri = vscode.Uri.file(file)
+
+			try {
+				const stat = await vscode.workspace.fs.stat(uri)
+
+				if (stat.type !== vscode.FileType.File) {
+					reload('change non-file')
+					return
+				}
+
+				if (mtime === stat.mtime && size === stat.size) {
+					this.output.appendLine(`ignored: unchanged stat ${file}`)
+					return
+				}
+
+				const nextMtime = stat.mtime
+				const nextSize = stat.size
+
+				let nextHash: string
+				try {
+					nextHash = await digest(uri)
+				} catch (err) {
+					this.output.appendLine(
+						`stat changed but hashing failed ${file}: ${String(err)}`,
+					)
+					reload('change uncertain')
+					return
+				}
+
+				if (
+					mtime !== undefined &&
+					size !== undefined &&
+					hash !== undefined &&
+					hash === nextHash
+				) {
+					mtime = nextMtime
+					size = nextSize
+					hash = nextHash
+					this.output.appendLine(`ignored: unchanged content ${file}`)
+					return
+				}
+
+				mtime = nextMtime
+				size = nextSize
+				hash = nextHash
+				reload('change')
+			} catch (err) {
+				this.output.appendLine(`change check failed ${file}: ${String(err)}`)
+				reload('change uncertain')
+			}
+		}
+
+		const onCreate = async () => {
+			mtime = undefined
+			size = undefined
+			hash = undefined
+			reload('create')
+		}
+
+		const onDelete = async () => {
+			mtime = undefined
+			size = undefined
+			hash = undefined
+			reload('delete')
+		}
+
+		watcher.onDidChange(() => {
+			void onChange()
+		})
+		watcher.onDidCreate(() => {
+			void onCreate()
+		})
+		watcher.onDidDelete(() => {
+			void onDelete()
+		})
 		this.output.appendLine(`watching: ${file}`)
 		return watcher
 	}
