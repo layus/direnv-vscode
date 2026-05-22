@@ -11,4 +11,8 @@ export class Checksum {
 	public digest() {
 		return this.hash.digest('base64url')
 	}
+
+	public static createHash(data: Uint8Array) {
+		return crypto.createHash('sha1').update(data).digest('base64url')
+	}
 }
